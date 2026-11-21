@@ -10,14 +10,16 @@ from __future__ import annotations
 from typing import Any
 
 from .auction import AuctionService
+from .core import InvalidState
 from .margin import MarginLedger
 
 
 class ClearingService:
-    def __init__(self, db, margin: MarginLedger, auctions: AuctionService):
+    def __init__(self, db, margin: MarginLedger, auctions: AuctionService, tenders=None):
         self.db = db
         self.margin = margin
         self.auctions = auctions
+        self.tenders = tenders
 
     def settle(self, request_id: str, auction_id: str) -> dict[str, Any]:
         """Idempotent, resumable settlement.
@@ -27,6 +29,12 @@ class ClearingService:
         are processed, and the frozen ranking is read back, never recomputed.
         """
         return self.auctions.settle_auction(request_id, auction_id)
+
+    def settle_tender(self, request_id: str, tender_id: str) -> dict[str, Any]:
+        """Idempotent, resumable clearing of a frozen joint tender."""
+        if self.tenders is None:
+            raise InvalidState("no tender service wired into this clearing service")
+        return self.tenders.settle_tender(request_id, tender_id)
 
     def account_statement(self, buyer: str) -> dict[str, Any]:
         """Ledger-shaped statement derived from raw events."""
@@ -98,3 +106,33 @@ class ClearingService:
                 )
             ]
         return [self.margin.balance(b) for b in buyers]
+
+    def tender_statement(self, tender_id: str) -> dict[str, Any]:
+        """Frozen tender result plus the raw charge/release events."""
+        if self.tenders is None:
+            raise InvalidState("no tender service wired into this clearing service")
+        result = self.tenders.read_result(tender_id)
+        with self.db.read() as conn:
+            charges = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT seq, buyer, hold_id, amount_cents, at FROM ledger_events "
+                    "WHERE auction_id=? AND kind='CHARGE' ORDER BY seq",
+                    (tender_id,),
+                )
+            ]
+            releases = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT seq, buyer, hold_id, amount_cents, at FROM ledger_events "
+                    "WHERE auction_id=? AND kind='RELEASE' ORDER BY seq",
+                    (tender_id,),
+                )
+            ]
+        return {
+            "tender": result,
+            "charge_events": charges,
+            "release_events": releases,
+            "total_charged_cents": sum(c["amount_cents"] for c in charges),
+            "total_released_cents": sum(r["amount_cents"] for r in releases),
+        }

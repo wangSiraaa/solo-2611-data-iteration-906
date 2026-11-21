@@ -345,17 +345,24 @@ class MarginLedger:
         buyer: str,
         auction_id: str,
         required_cents: int,
+        contract_kind: str = "UNIT_AUCTION",
     ) -> dict[str, Any]:
-        """Auction-side verification of a presented hold, inside the bid tx.
+        """Auction/tender-side verification of a presented hold, in-tx.
 
-        The auction never trusts caller-supplied "already frozen" claims: it
-        reads the warehouse row and checks owner, auction, amount and status.
+        The services never trust caller-supplied "already frozen" claims:
+        they read the warehouse row and check owner, scope, amount, status
+        and the explicit contract kind, so a hold minted for one operation
+        version cannot be spent in the other.
         """
         row = conn.execute("SELECT * FROM holds WHERE hold_id=?", (hold_id,)).fetchone()
         if row is None:
             raise DomainError(f"unknown hold credential {hold_id!r}")
         hold = dict(row)
         errors = []
+        if hold["contract_kind"] != contract_kind:
+            errors.append(
+                f"contract kind mismatch ({hold['contract_kind']} != {contract_kind})"
+            )
         if hold["buyer"] != buyer:
             errors.append(f"buyer mismatch ({hold['buyer']} != {buyer})")
         if hold["auction_id"] != auction_id:

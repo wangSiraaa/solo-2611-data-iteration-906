@@ -6,6 +6,7 @@ balances and auction totals from the smallest raw records:
   * ledger_events  (DEPOSIT / FREEZE / RELEASE / CHARGE)
   * bids + bid_events (final valid bid set)
   * settlements.allocations_json (frozen result)
+  * menus + tender_settlements (joint package tender)
 
 and reports every discrepancy instead of trusting cached balances.
 """
@@ -16,6 +17,7 @@ import json
 from typing import Any
 
 from .core import DataIntegrityError
+from .solver import solve_package_tender
 
 
 def reconcile(db) -> dict[str, Any]:
@@ -241,11 +243,187 @@ def reconcile(db) -> dict[str, Any]:
                 ],
             }
 
+        # ---------------- per-tender optimum + totals ----------------
+        tender_reports: dict[str, Any] = {}
+        for tender in conn.execute(
+            "SELECT tender_id, resources_json, status, frozen_at FROM tenders "
+            "ORDER BY tender_id"
+        ):
+            tid = tender["tender_id"]
+            row = conn.execute(
+                "SELECT result_json, status FROM tender_settlements WHERE tender_id=?",
+                (tid,),
+            ).fetchone()
+            charges = conn.execute(
+                "SELECT COALESCE(SUM(amount_cents),0) AS v FROM ledger_events "
+                "WHERE auction_id=? AND kind='CHARGE'",
+                (tid,),
+            ).fetchone()["v"]
+            if row is None:
+                if tender["status"] != "OPEN":
+                    violations.append(f"{tid}: non-open tender without settlement")
+                tender_reports[tid] = {"status": tender["status"], "settled": False}
+                continue
+
+            snap = json.loads(row["result_json"])
+            supply = json.loads(tender["resources_json"])
+            menus = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT menu_id, buyer, revision, options_json, hold_id "
+                    "FROM menus WHERE tender_id=? AND status='ACTIVE'",
+                    (tid,),
+                )
+            ]
+
+            # Re-derive freeze-time eligibility from immutable guarantee
+            # parameters plus the raw event timeline: a guarantee was live at
+            # cutoff iff no RELEASE/CHARGE leg predates frozen_at.
+            derived_eligible: list[str] = []
+            for m in menus:
+                hold = conn.execute(
+                    "SELECT * FROM holds WHERE hold_id=?", (m["hold_id"],)
+                ).fetchone()
+                if hold is None:
+                    violations.append(f"{tid}/{m['menu_id']}: guarantee row missing")
+                    continue
+                options = json.loads(m["options_json"])
+                max_price = max(o["price_cents"] for o in options)
+                ok = (
+                    hold["contract_kind"] == "PACKAGE_TENDER"
+                    and hold["auction_id"] == tid
+                    and hold["buyer"] == m["buyer"]
+                    and hold["menu_id"] == m["menu_id"]
+                    and hold["menu_revision"] == m["revision"]
+                    and hold["amount_cents"] >= max_price
+                )
+                terminal = conn.execute(
+                    "SELECT 1 FROM ledger_events WHERE hold_id=? "
+                    "AND kind IN ('RELEASE','CHARGE') AND at < ? LIMIT 1",
+                    (m["hold_id"], tender["frozen_at"]),
+                ).fetchone()
+                if terminal is not None:
+                    ok = False
+                if ok:
+                    derived_eligible.append(m["menu_id"])
+            if sorted(derived_eligible) != sorted(snap["eligible_menu_ids"]):
+                violations.append(
+                    f"{tid}: frozen eligible set {snap['eligible_menu_ids']} != "
+                    f"re-derived {sorted(derived_eligible)}"
+                )
+
+            # Independent re-run of winner determination on raw menus.
+            result = solve_package_tender(
+                supply,
+                [
+                    {
+                        "menu_id": m["menu_id"],
+                        "buyer": m["buyer"],
+                        "options": json.loads(m["options_json"]),
+                    }
+                    for m in menus
+                    if m["menu_id"] in set(derived_eligible)
+                ],
+            )
+            if result["total_cents"] != snap["total_cents"] or result["labels"] != snap["labels"]:
+                violations.append(
+                    f"{tid}: frozen optimum ({snap['total_cents']}, "
+                    f"{snap['labels']}) != re-derived "
+                    f"({result['total_cents']}, {result['labels']})"
+                )
+
+            # Winners must match raw menu contents and their guarantees.
+            menu_by_id = {m["menu_id"]: m for m in menus}
+            for w in snap["winners"]:
+                m = menu_by_id.get(w["menu_id"])
+                if m is None:
+                    violations.append(f"{tid}/{w['menu_id']}: winner menu not active")
+                    continue
+                if m["hold_id"] != w["hold_id"]:
+                    violations.append(
+                        f"{tid}/{w['menu_id']}: guarantee credential mismatch in freeze"
+                    )
+                opt = next(
+                    (o for o in json.loads(m["options_json"]) if o["label"] == w["label"]),
+                    None,
+                )
+                if (
+                    opt is None
+                    or opt["price_cents"] != w["price_cents"]
+                    or opt["resources"] != w["resources"]
+                ):
+                    violations.append(
+                        f"{tid}/{w['menu_id']}: winning option {w['label']!r} "
+                        "does not match the raw menu"
+                    )
+            if sorted(w["label"] for w in snap["winners"]) != snap["labels"]:
+                violations.append(f"{tid}: winner labels do not match frozen label list")
+            if len({w["buyer"] for w in snap["winners"]}) != len(snap["winners"]):
+                violations.append(f"{tid}: a buyer wins more than one option")
+            derived_usage = {r: 0 for r in supply}
+            for w in snap["winners"]:
+                for r, q in w["resources"].items():
+                    derived_usage[r] = derived_usage.get(r, 0) + q
+            if derived_usage != {r: snap["usage"].get(r, 0) for r in supply}:
+                violations.append(f"{tid}: frozen usage inconsistent with winners")
+            for r, used in snap["usage"].items():
+                if used > supply.get(r, 0):
+                    violations.append(f"{tid}: resource {r} over-allocated ({used} > {supply.get(r, 0)})")
+
+            expected_charge_total = sum(w["price_cents"] for w in snap["winners"])
+            if row["status"] == "CLEARED" and charges != expected_charge_total:
+                violations.append(
+                    f"{tid}: raw CHARGE total {charges} != expected winner "
+                    f"payments {expected_charge_total}"
+                )
+            dup = conn.execute(
+                "SELECT hold_id, COUNT(*) AS n FROM ledger_events WHERE auction_id=? "
+                "AND kind='CHARGE' GROUP BY hold_id HAVING n > 1",
+                (tid,),
+            ).fetchall()
+            if dup:
+                violations.append(f"{tid}: duplicate CHARGE for holds {[d[0] for d in dup]}")
+            if row["status"] == "CLEARED":
+                for w in snap["winners"]:
+                    h = conn.execute(
+                        "SELECT status, charged_cents FROM holds WHERE hold_id=?",
+                        (w["hold_id"],),
+                    ).fetchone()
+                    if h is None or h["status"] != "CONSUMED" or h["charged_cents"] != w["price_cents"]:
+                        violations.append(
+                            f"{tid}/{w['menu_id']}: winner guarantee not consumed "
+                            f"for exactly {w['price_cents']}"
+                        )
+                for m in menus:
+                    h = conn.execute(
+                        "SELECT status FROM holds WHERE hold_id=?", (m["hold_id"],)
+                    ).fetchone()
+                    if h is None or h["status"] not in ("CONSUMED", "RELEASED"):
+                        violations.append(
+                            f"{tid}/{m['menu_id']}: guarantee not terminal after clearing"
+                        )
+
+            tender_reports[tid] = {
+                "status": tender["status"],
+                "settlement_status": row["status"],
+                "resources": supply,
+                "usage": snap["usage"],
+                "total_cents": snap["total_cents"],
+                "labels": snap["labels"],
+                "winners": [
+                    {"menu_id": w["menu_id"], "buyer": w["buyer"],
+                     "label": w["label"], "price_cents": w["price_cents"]}
+                    for w in snap["winners"]
+                ],
+                "raw_charge_total_cents": charges,
+            }
+
     return {
         "ok": not violations,
         "violations": violations,
         "buyers": buyer_reports,
         "auctions": auction_reports,
+        "tenders": tender_reports,
     }
 
 

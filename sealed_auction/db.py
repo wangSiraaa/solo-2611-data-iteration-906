@@ -32,6 +32,13 @@ CREATE TABLE IF NOT EXISTS holds (
     amount_cents     INTEGER NOT NULL CHECK (amount_cents >= 0),
     status           TEXT NOT NULL CHECK (status IN ('ACTIVE','RELEASED','CONSUMED')),
     charged_cents    INTEGER NOT NULL DEFAULT 0 CHECK (charged_cents >= 0),
+    -- Explicit contract kind separates the two operation versions:
+    -- UNIT_AUCTION holds back per-auction bids; PACKAGE_TENDER guarantees
+    -- back one menu revision of the joint tender and record that binding.
+    contract_kind    TEXT NOT NULL DEFAULT 'UNIT_AUCTION'
+                     CHECK (contract_kind IN ('UNIT_AUCTION','PACKAGE_TENDER')),
+    menu_id          TEXT,
+    menu_revision    INTEGER,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
@@ -107,6 +114,62 @@ CREATE TABLE IF NOT EXISTS settlements (
     created_at             TEXT NOT NULL,
     cleared_at             TEXT
 );
+
+-- ---------------------------------------------------------------------------
+-- Joint package tender (联合密封征集), parallel to the unit auctions above.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS tenders (
+    tender_id        TEXT PRIMARY KEY,
+    resources_json   TEXT NOT NULL,
+    status           TEXT NOT NULL CHECK (status IN ('OPEN','FROZEN','SETTLED')),
+    created_at       TEXT NOT NULL,
+    frozen_at        TEXT,
+    settled_at       TEXT
+);
+
+-- One menu = one buyer's set of mutually exclusive package options (XOR).
+-- menu_id is the stable label; revisions replace options + guarantee atomically.
+CREATE TABLE IF NOT EXISTS menus (
+    menu_id          TEXT PRIMARY KEY,
+    tender_id        TEXT NOT NULL REFERENCES tenders(tender_id),
+    buyer            TEXT NOT NULL,
+    revision         INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+    options_json     TEXT NOT NULL,
+    status           TEXT NOT NULL CHECK (status IN ('ACTIVE','CANCELLED')),
+    hold_id          TEXT NOT NULL REFERENCES holds(hold_id),
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+-- At most one valid menu per buyer per tender.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_menu_active_buyer
+    ON menus(tender_id, buyer) WHERE status = 'ACTIVE';
+-- A guarantee can back at most one valid menu at a time.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_menu_active_hold
+    ON menus(hold_id) WHERE status = 'ACTIVE';
+CREATE INDEX IF NOT EXISTS idx_menus_tender ON menus(tender_id);
+
+CREATE TABLE IF NOT EXISTS menu_events (
+    seq               INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id        TEXT NOT NULL,
+    menu_id           TEXT NOT NULL,
+    tender_id         TEXT NOT NULL,
+    buyer             TEXT NOT NULL,
+    action            TEXT NOT NULL CHECK (action IN ('SUBMIT','REVISE','WITHDRAW')),
+    revision          INTEGER NOT NULL,
+    options_json      TEXT NOT NULL,
+    hold_id           TEXT NOT NULL,
+    at                TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_menu_events_tender ON menu_events(tender_id);
+
+CREATE TABLE IF NOT EXISTS tender_settlements (
+    tender_id          TEXT PRIMARY KEY REFERENCES tenders(tender_id),
+    result_json        TEXT NOT NULL,
+    status             TEXT NOT NULL CHECK (status IN ('FROZEN','CLEARING','CLEARED')),
+    created_at         TEXT NOT NULL,
+    cleared_at         TEXT
+);
 """
 
 
@@ -137,8 +200,23 @@ class Database:
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.execute("PRAGMA synchronous = FULL")
             conn.executescript(SCHEMA)
+            self._migrate(conn)
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add contract-kind/binding columns to pre-existing hold tables."""
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(holds)")}
+        if "contract_kind" not in cols:
+            conn.execute(
+                "ALTER TABLE holds ADD COLUMN contract_kind "
+                "TEXT NOT NULL DEFAULT 'UNIT_AUCTION'"
+            )
+        if "menu_id" not in cols:
+            conn.execute("ALTER TABLE holds ADD COLUMN menu_id TEXT")
+        if "menu_revision" not in cols:
+            conn.execute("ALTER TABLE holds ADD COLUMN menu_revision INTEGER")
 
     @contextlib.contextmanager
     def tx(self):
